@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Transformer based language model."""
 
@@ -7,14 +7,14 @@ import torch.nn.functional as F
 
 from megatron import get_args
 from megatron.core import mpu, tensor_parallel
+from megatron.core.enums import ModelType
 
-from .enums import LayerType, AttnMaskType
+from .enums import AttnMaskType, LayerType
 from .module import MegatronModule
-from .retro_transformer import ParallelRetroEncoder, ParallelRetroTransformer
 from .rotary_pos_embedding import apply_rotary_pos_emb, RotaryEmbedding
 from .transformer import ParallelTransformer
 from .utils import get_linear_layer
-from .utils import init_method_normal, scaled_init_method_normal
+from .utils import init_method_normal, scaled_init_method_normal, gather_and_init
 
 
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
@@ -39,7 +39,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
         bias=bias,
         gradient_accumulation_fusion=args.gradient_accumulation_fusion,
         async_grad_allreduce=async_grad_allreduce,
-        sequence_parallel_enabled=args.sequence_parallel)
+        sequence_parallel=args.sequence_parallel)
     # Gather if needed.
 
     if parallel_output:
@@ -48,26 +48,24 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
     return tensor_parallel.gather_from_tensor_model_parallel_region(logits_parallel)
 
 
-def get_language_model(num_tokentypes, add_pooler,
-                       encoder_attn_mask_type, init_method=None,
-                       scaled_init_method=None, add_encoder=True,
+def get_language_model(config, num_tokentypes, add_pooler,
+                       encoder_attn_mask_type,
+                       add_encoder=True,
                        add_decoder=False,
                        decoder_attn_mask_type=AttnMaskType.causal,
-                       pre_process=True, post_process=True):
+                       pre_process=True, post_process=True, num_experts=[1]):
     """Build language model and return along with the key to save."""
     args = get_args()
+    if config.init_method is None:
+        config.init_method = init_method_normal(config.init_method_std)
 
-    if init_method is None:
-        init_method = init_method_normal(args.init_method_std)
-
-    if scaled_init_method is None:
-        scaled_init_method = scaled_init_method_normal(args.init_method_std,
-                                                       args.num_layers)
+    if config.output_layer_init_method is None:
+        config.output_layer_init_method = scaled_init_method_normal(config.init_method_std,
+                                                                    config.num_layers)
 
     # Language model.
     language_model = TransformerLanguageModel(
-        init_method,
-        scaled_init_method,
+        config,
         encoder_attn_mask_type,
         num_tokentypes=num_tokentypes,
         add_encoder=add_encoder,
@@ -75,8 +73,8 @@ def get_language_model(num_tokentypes, add_pooler,
         decoder_attn_mask_type=decoder_attn_mask_type,
         add_pooler=add_pooler,
         pre_process=pre_process,
-        post_process=post_process
-    )
+        post_process=post_process,
+        num_experts=num_experts)
     # key used for checkpoints.
     language_model_key = 'language_model'
 
@@ -98,7 +96,7 @@ class Pooler(MegatronModule):
     def __init__(self, hidden_size, init_method):
         super(Pooler, self).__init__()
         args = get_args()
-        self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
+        self.dense = get_linear_layer(hidden_size, hidden_size, init_method, gather_params_on_init=args.zero_stage == 3)
         self.sequence_parallel = args.sequence_parallel
 
 
@@ -131,6 +129,10 @@ class Embedding(MegatronModule):
         init_method: weight initialization method
         num_tokentypes: size of the token-type embeddings. 0 value
                         will ignore this embedding
+        embedding_weights_in_fp32: casts word embedding weights to
+                                   fp32 before sampling. Required to
+                                   maintain reproducibility when
+                                   training in bf16.
     """
 
     def __init__(self,
@@ -138,35 +140,42 @@ class Embedding(MegatronModule):
                  vocab_size,
                  max_sequence_length,
                  embedding_dropout_prob,
-                 init_method,
-                 num_tokentypes=0):
+                 config,
+                 num_tokentypes=0,
+                 embedding_weights_in_fp32=False):
         super(Embedding, self).__init__()
 
         self.hidden_size = hidden_size
-        self.init_method = init_method
+        self.init_method = config.init_method
         self.num_tokentypes = num_tokentypes
 
         args = get_args()
 
         # Word embeddings (parallel).
+        self.embedding_weights_in_fp32 = embedding_weights_in_fp32
+        self.params_dtype = args.params_dtype
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-            vocab_size, self.hidden_size,
-            init_method=self.init_method,
-            params_dtype=args.params_dtype,
-            use_cpu_initialization=args.use_cpu_initialization,
-            perform_initialization=args.perform_initialization
-        )
+            vocab_size, self.hidden_size, config=config, init_method=config.init_method)
         self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).
         self.add_position_embedding = args.add_position_embedding
         if self.add_position_embedding:
-            self.position_embeddings = torch.nn.Embedding(
-                max_sequence_length, self.hidden_size)
             self._position_embeddings_key = 'position_embeddings'
-            # Initialize the position embeddings.
-            if args.perform_initialization:
-                self.init_method(self.position_embeddings.weight)
+            if args.sequence_parallel:
+                self.position_embeddings = tensor_parallel.layers.SequenceParallelPositionEmbedding(
+                    max_sequence_length, self.hidden_size)
+                # Initialize the position embeddings.
+                self.init_method(self.position_embeddings.local_embeddings.weight)
+            else:
+                self.position_embeddings = torch.nn.Embedding(
+                    max_sequence_length, self.hidden_size)
+                # Initialize the position embeddings.
+                if args.perform_initialization:
+                    if args.zero_stage == 3:
+                        gather_and_init(self.position_embeddings.weight, self.init_method)
+                    else:
+                        self.init_method(self.position_embeddings.weight)
 
         # Token type embedding.
         # Add this as an optional field that can be added through
@@ -178,11 +187,14 @@ class Embedding(MegatronModule):
                                                            self.hidden_size)
             # Initialize the token-type embeddings.
             if args.perform_initialization:
-                self.init_method(self.tokentype_embeddings.weight)
+                if args.zero_stage == 3:
+                    gather_and_init(self.tokentype_embeddings.weight, self.init_method)
+                else:
+                    self.init_method(self.tokentype_embeddings.weight)
         else:
             self.tokentype_embeddings = None
 
-        self.fp32_residual_connection = args.fp32_residual_connection 
+        self.fp32_residual_connection = args.fp32_residual_connection
         self.sequence_parallel = args.sequence_parallel
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
@@ -217,7 +229,12 @@ class Embedding(MegatronModule):
 
     def forward(self, input_ids, position_ids, tokentype_ids=None):
         # Embeddings.
+        if self.embedding_weights_in_fp32:
+            self.word_embeddings = self.word_embeddings.to(torch.float32)
         words_embeddings = self.word_embeddings(input_ids)
+        if self.embedding_weights_in_fp32:
+            words_embeddings = words_embeddings.to(self.params_dtype)
+            self.word_embeddings = self.word_embeddings.to(self.params_dtype)
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = words_embeddings + position_embeddings
@@ -239,7 +256,8 @@ class Embedding(MegatronModule):
 
         # Dropout.
         if self.sequence_parallel:
-            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+            # already partition sequence, do not need scatter_to_sequence_parallel_region
+            # embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)
         else:
@@ -312,6 +330,40 @@ class Embedding(MegatronModule):
                       'checkpoint but could not find it', flush=True)
 
 
+class EmbeddingPipe(Embedding):
+
+    def forward(self, inputs, **kwargs):
+        if not hasattr(self, '_args'):
+            self._args = get_args()
+
+        input_ids = inputs[0]
+        position_ids = inputs[1]
+        if hasattr(self._args, 'attn_mask'):
+            attention_mask = None
+        else:
+            attention_mask = inputs[2]
+
+        if len(inputs) == 4:
+            tokentype_ids = inputs[3]
+        else:
+            tokentype_ids = None
+        
+        embeddings = super().forward(input_ids, position_ids, tokentype_ids=tokentype_ids)
+
+        # If cmd args has attn_mask, we don't forward it as an activation.
+        if hasattr(self._args, 'attn_mask'):
+            return embeddings
+        else:
+            assert False
+            return embeddings, attention_mask
+
+
+    @property
+    def word_embeddings_weight(self):
+        """Easy accessory for the DeepSpeed pipeline engine to tie embeddings across stages."""
+        return self.word_embeddings.weight
+
+
 class TransformerLanguageModel(MegatronModule):
     """Transformer language model.
 
@@ -326,8 +378,7 @@ class TransformerLanguageModel(MegatronModule):
     """
 
     def __init__(self,
-                 init_method,
-                 output_layer_init_method,
+                 config,
                  encoder_attn_mask_type,
                  num_tokentypes=0,
                  add_encoder=True,
@@ -335,24 +386,27 @@ class TransformerLanguageModel(MegatronModule):
                  decoder_attn_mask_type=AttnMaskType.causal,
                  add_pooler=False,
                  pre_process=True,
-                 post_process=True):
+                 post_process=True,
+                 num_experts=[1]):
         args = get_args()
-        # TODO: passing share_word_embeddings=False will not work correctly for T5 and embeddings will not be synced. Fix later for T5.
+        # TODO: passing share_embeddings_and_output_weights=False will not work correctly for T5 and embeddings will not be synced. Fix later for T5.
         if args.untie_embeddings_and_output_weights: assert not add_decoder
-        super(TransformerLanguageModel, self).__init__(share_word_embeddings=not args.untie_embeddings_and_output_weights)
+        super(TransformerLanguageModel, self).__init__(share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights)
 
         self.pre_process = pre_process
         self.post_process = post_process
-        self.hidden_size = args.hidden_size
+        self.hidden_size = config.hidden_size
         self.num_tokentypes = num_tokentypes
-        self.init_method = init_method
+        self.init_method = config.init_method
         self.add_encoder = add_encoder
         self.encoder_attn_mask_type = encoder_attn_mask_type
         self.add_decoder = add_decoder
         self.decoder_attn_mask_type = decoder_attn_mask_type
         self.add_pooler = add_pooler
         self.encoder_hidden_state = None
+        self.add_retriever = args.retro_add_retriever
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
+        self.num_experts = num_experts
 
         # Embeddings.
         if self.pre_process:
@@ -360,8 +414,9 @@ class TransformerLanguageModel(MegatronModule):
                                        args.padded_vocab_size,
                                        args.max_position_embeddings,
                                        args.hidden_dropout,
-                                       self.init_method,
-                                       self.num_tokentypes)
+                                       config,
+                                       self.num_tokentypes,
+                                       args.embedding_weights_in_fp32)
             self._embedding_key = 'embedding'
 
         # Rotary positional embeddings
@@ -378,41 +433,20 @@ class TransformerLanguageModel(MegatronModule):
             # partial rotary embeddings, which is better than full rotary
             # Wang and Komatsuzaki et al
             # https://github.com/kingoflolz/mesh-transformer-jax/
-            self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
-
-        # Retriever (bi-directional transformer with cross attention)
-        if args.retro_add_retriever:
-            self.retriever = ParallelRetroEncoder(
-                self.init_method,
-                output_layer_init_method,
-                self_attn_mask_type=AttnMaskType.padding,
-                pre_process=self.pre_process,
-                post_process=False,
-            )
-            self._retriever_key = 'retriever'
-        else:
-            self.retriever = None
+            self.rotary_pos_emb = RotaryEmbedding(rotary_dim, theta=args.rope_theta)
 
         # Encoder (usually set to True, False if part of an encoder-decoder
         # architecture and in encoder-only stage).
         if self.add_encoder:
-            if args.retro_add_retriever:
-                self.encoder = ParallelRetroTransformer(
-                    self.init_method,
-                    output_layer_init_method,
-                    self_attn_mask_type=self.encoder_attn_mask_type,
-                    pre_process=self.pre_process,
-                    post_process=self.post_process,
-                    retriever=self.retriever,
-                )
-            else:
-                self.encoder = ParallelTransformer(
-                    self.init_method,
-                    output_layer_init_method,
-                    self_attn_mask_type=self.encoder_attn_mask_type,
-                    pre_process=self.pre_process,
-                    post_process=self.post_process,
-                )
+            self.encoder = ParallelTransformer(
+                config,
+                model_type=args.model_type if not args.retro_add_retriever \
+                    else ModelType.retro_decoder,
+                self_attn_mask_type=self.encoder_attn_mask_type,
+                pre_process=self.pre_process,
+                post_process=self.post_process,
+                num_experts=self.num_experts
+            )
             self._encoder_key = 'encoder'
         else:
             self.encoder = None
@@ -421,12 +455,13 @@ class TransformerLanguageModel(MegatronModule):
         # architecture and in decoder-only stage).
         if self.add_decoder:
             self.decoder = ParallelTransformer(
-                self.init_method,
-                output_layer_init_method,
+                config,
+                model_type=args.model_type,
                 layer_type=LayerType.decoder,
                 self_attn_mask_type=self.decoder_attn_mask_type,
                 pre_process=self.pre_process,
-                post_process=self.post_process)
+                post_process=self.post_process,
+                num_experts=self.num_experts)
             self._decoder_key = 'decoder'
         else:
             self.decoder = None
@@ -441,8 +476,9 @@ class TransformerLanguageModel(MegatronModule):
                 self.output_layer = tensor_parallel.ColumnParallelLinear(
                     args.hidden_size,
                     args.padded_vocab_size,
-                    bias=False, # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
-                    init_method=self.init_method)
+                    config=config,
+                    init_method=self.init_method,
+                    bias=False) # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
                 self._output_layer_key = 'output_layer'
 
     def set_input_tensor(self, input_tensor):
@@ -475,25 +511,28 @@ class TransformerLanguageModel(MegatronModule):
 
     def forward(self, enc_input_ids, enc_position_ids, enc_attn_mask,
                 dec_input_ids=None, dec_position_ids=None, dec_attn_mask=None,
-                ret_input_ids=None, ret_position_ids=None, ret_attn_mask=None,
+                retriever_input_ids=None,
+                retriever_position_ids=None,
+                retriever_attn_mask=None,
                 enc_dec_attn_mask=None, tokentype_ids=None,
                 inference_params=None,
                 pooling_sequence_index=0,
                 enc_hidden_states=None, output_enc_hidden=False):
-
-        # Retriever embedding.
-        if self.retriever and self.pre_process:
-            retriever_input = self.embedding(ret_input_ids, ret_position_ids,
-                                             tokentype_ids=tokentype_ids)
-        else:
-            retriever_input = None
-
+        args = get_args()
         # Encoder embedding.
         if self.pre_process:
             encoder_input = self.embedding(enc_input_ids, enc_position_ids,
                                            tokentype_ids=tokentype_ids)
         else:
             encoder_input = None
+
+        # Retriever embedding.
+        if self.add_retriever and self.pre_process:
+            retriever_input = self.embedding(retriever_input_ids,
+                                             retriever_position_ids,
+                                             tokentype_ids=tokentype_ids)
+        else:
+            retriever_input = None
 
         # Rotary positional embeddings
         rotary_pos_emb = None
@@ -502,28 +541,25 @@ class TransformerLanguageModel(MegatronModule):
                 rotary_pos_emb = \
                     self.rotary_pos_emb(inference_params.max_sequence_len)
             else:
-                rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
+                if args.curriculum_learning_legacy or args.data_efficiency_curriculum_learning:
+                    rotary_pos_emb = self.rotary_pos_emb(args.curriculum_seqlen)
+                else:
+                    rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
 
         # Run encoder.
         if enc_hidden_states is None:
             if self.encoder is not None:
-                if self.retriever:
-                    encoder_output = self.encoder(
-                        encoder_input,
-                        enc_attn_mask,
-                        retriever_output=retriever_input,
-                        retriever_attn_mask=ret_attn_mask,
-                        inference_params=inference_params)
-                else:
-                    encoder_output = self.encoder(
-                        encoder_input,
-                        enc_attn_mask,
-                        inference_params=inference_params,
-                        rotary_pos_emb=rotary_pos_emb)
+                encoder_output, *encoder_moe_losses = self.encoder(
+                    encoder_input,
+                    enc_attn_mask,
+                    retriever_input=retriever_input,
+                    retriever_attn_mask=retriever_attn_mask,
+                    inference_params=inference_params,
+                    rotary_pos_emb=rotary_pos_emb)
             else:
                 encoder_output = self.encoder_hidden_state
         else:
-            encoder_output = enc_hidden_states.to(encoder_input.dtype)
+            encoder_output, encoder_moe_losses = enc_hidden_states.to(encoder_input.dtype), []
 
         if self.post_process:
             if self.add_pooler:
@@ -535,9 +571,9 @@ class TransformerLanguageModel(MegatronModule):
         # similarity between two sequences by average pooling
         if not self.add_decoder or output_enc_hidden:
             if self.add_pooler and self.post_process:
-                return encoder_output, pooled_output
+                return encoder_output, pooled_output, encoder_moe_losses
             else:
-                return encoder_output
+                return encoder_output, encoder_moe_losses
 
         # Decoder embedding.
         if self.pre_process:
@@ -547,7 +583,7 @@ class TransformerLanguageModel(MegatronModule):
             decoder_input = None
 
         # Run decoder.
-        decoder_output = self.decoder(
+        decoder_output, *decoder_moe_losses = self.decoder(
             decoder_input,
             dec_attn_mask,
             encoder_output=encoder_output,
@@ -556,22 +592,40 @@ class TransformerLanguageModel(MegatronModule):
             rotary_pos_emb=rotary_pos_emb)
 
         if self.add_pooler and self.post_process:
-            return decoder_output, encoder_output, pooled_output
+            return decoder_output, encoder_output, pooled_output, decoder_moe_losses, encoder_moe_losses
         else:
-            return decoder_output, encoder_output
+            return decoder_output, encoder_output, decoder_moe_losses, encoder_moe_losses
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """For easy load."""
-
+        args = get_args()
         state_dict_ = {}
+        moe_state_dict = {}
         if self.pre_process:
             state_dict_[self._embedding_key] \
                 = self.embedding.state_dict_for_save_checkpoint(prefix=prefix,
                                                                 keep_vars=keep_vars)
         if self.add_encoder:
-            state_dict_[self._encoder_key] \
-                = self.encoder.state_dict_for_save_checkpoint(prefix=prefix,
-                                                              keep_vars=keep_vars)
+            encoder_state_dict = self.encoder.state_dict_for_save_checkpoint(
+                prefix=prefix, keep_vars=keep_vars)
+            if args.random_ltd:
+                # When using random-LTD, it is required to call remove_random_ltd_state_dict
+                # during model checkpoint saving to transfer the random-LTD-wrapped
+                # layers back to original layers. This will help to remove the dependency
+                # to random-LTD inside the checkpoint, so that during evaluation or
+                # finetuning of the checkpoint there is no need to depend on random-LTD
+                # again.
+                from deepspeed.runtime.data_pipeline.data_routing.helper import remove_random_ltd_state_dict
+                encoder_state_dict = remove_random_ltd_state_dict(encoder_state_dict)
+            # MoE states need to be handled separately by DeepSpeed engine, thus
+            # moving them to the top level dictionary
+            # If components other than encoder may contain MoE states, need to add
+            # the same logic
+            for key in list(encoder_state_dict.keys()):
+                if 'expert' in key and 'moe.gate.wg.weight' not in key:
+                    moe_state_dict[self._encoder_key+key] = encoder_state_dict.pop(key)
+            state_dict_[self._encoder_key] = encoder_state_dict
+
         if self.post_process:
             if self.add_pooler:
                 state_dict_[self._pooler_key] \
@@ -586,6 +640,7 @@ class TransformerLanguageModel(MegatronModule):
                 = self.decoder.state_dict_for_save_checkpoint(prefix=prefix,
                                                               keep_vars=keep_vars)
 
+        state_dict_["moe_state_dict"] = moe_state_dict
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):
@@ -618,15 +673,31 @@ class TransformerLanguageModel(MegatronModule):
                         state_dict_[key.split('transformer.')[1]] = state_dict[key]
 
             # For backward compatibility.
+            # Somehow this backward compatibility could be wrong: sometimes
+            # '.attention.' is the actual key used so should not be replaced. Thus
+            # added another logic to only replace if the key does not match
             state_dict_self_attention = {}
+            encoder_state_dict_keys = list(self.encoder.state_dict().keys())
             for key in state_dict_.keys():
-                if '.attention.' in key:
+                if '.attention.' in key and key not in encoder_state_dict_keys:
                     state_dict_self_attention[key.replace(".attention.",
                         ".self_attention.")] = state_dict_[key]
                 else:
                     state_dict_self_attention[key] = state_dict_[key]
             state_dict_ = state_dict_self_attention
 
+            # Gather encoder MoE states
+            if "moe_state_dict" in state_dict:
+                for key in list(state_dict["moe_state_dict"].keys()):
+                    if self._encoder_key in key:
+                        key_list = key.split('.')
+                        while key_list[0] != 'encoder':
+                            key_list.pop(0)
+                        key_list.pop(0)
+                        actual_key = '.'.join(key_list)
+                        state_dict_[actual_key] = state_dict["moe_state_dict"].pop(key)
+                if len(state_dict["moe_state_dict"]) == 0:
+                    del state_dict["moe_state_dict"]
             self.encoder.load_state_dict(state_dict_, strict=strict)
 
         # Pooler.

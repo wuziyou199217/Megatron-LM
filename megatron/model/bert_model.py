@@ -47,31 +47,27 @@ class BertLMHead(MegatronModule):
     """Masked LM head for Bert
 
     Arguments:
+        config: TransformerConfig object
         mpu_vocab_size: model parallel size of vocabulary.
         hidden_size: hidden size
-        init_method: init method for weight initialization
-        layernorm_epsilon: tolerance for layer norm divisions
         parallel_output: whether output logits being distributed or not.
     """
 
-    def __init__(self, mpu_vocab_size, hidden_size, init_method,
-                 layernorm_epsilon, parallel_output):
-
-        super(BertLMHead, self).__init__()
+    def __init__(self, mpu_vocab_size, hidden_size, config, parallel_output):
+        super().__init__(config=config)
 
         args = get_args()
-
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
         tensor_parallel.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
         self.parallel_output = parallel_output
 
-        self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
-        setattr(self.dense.weight, 'sequence_parallel', args.sequence_parallel)
-        setattr(self.dense.bias, 'sequence_parallel', args.sequence_parallel)
+        self.dense = get_linear_layer(hidden_size, hidden_size, config.init_method, gather_params_on_init=args.zero_stage == 3)
+        setattr(self.dense.weight, 'sequence_parallel', config.sequence_parallel)
+        setattr(self.dense.bias, 'sequence_parallel', config.sequence_parallel)
 
         self.layernorm = LayerNorm(hidden_size,
-                                   eps=layernorm_epsilon,
-                                   sequence_parallel=args.sequence_parallel)
+                                   eps=config.layernorm_epsilon,
+                                   sequence_parallel=config.sequence_parallel)
         self.gelu = torch.nn.functional.gelu
         if args.openai_gelu:
             self.gelu = openai_gelu
@@ -124,12 +120,14 @@ class BertModel(MegatronModule):
     """Bert Language model."""
 
     def __init__(self,
+                 config,
                  num_tokentypes=2,
                  add_binary_head=True,
                  parallel_output=True,
                  pre_process=True,
-                 post_process=True):
-        super(BertModel, self).__init__()
+                 post_process=True,
+                 return_moe_loss=False):
+        super().__init__(config=config)
         args = get_args()
 
         # TODO this option is not yet implemented in BERT
@@ -140,34 +138,32 @@ class BertModel(MegatronModule):
         self.parallel_output = parallel_output
         self.pre_process = pre_process
         self.post_process = post_process
+        self.return_moe_loss = return_moe_loss
 
         self.return_embeddings = args.output_bert_embeddings
         if self.return_embeddings:
             assert self.post_process and self.add_binary_head
 
-        init_method = init_method_normal(args.init_method_std)
-        scaled_init_method = scaled_init_method_normal(args.init_method_std,
-                                                       args.num_layers)
-
         self.language_model, self._language_model_key = get_language_model(
+            config=config,
             num_tokentypes=num_tokentypes,
             add_pooler=self.add_binary_head,
             encoder_attn_mask_type=AttnMaskType.padding,
-            init_method=init_method,
-            scaled_init_method=scaled_init_method,
             pre_process=self.pre_process,
-            post_process=self.post_process)
+            post_process=self.post_process,
+            num_experts=args.num_experts,
+        )
 
-        self.initialize_word_embeddings(init_method_normal)
+        self.initialize_word_embeddings()
         if self.post_process:
-            self.lm_head = BertLMHead(
-                self.word_embeddings_weight().size(0),
-                args.hidden_size, init_method, args.layernorm_epsilon, parallel_output)
+            self.lm_head = BertLMHead(self.shared_embedding_or_output_weight().size(0), config.hidden_size,
+                                      config, parallel_output)
             self._lm_head_key = 'lm_head'
             self.binary_head = None
             if self.add_binary_head:
-                self.binary_head = get_linear_layer(args.hidden_size, 2,
-                                                    init_method)
+                self.binary_head = get_linear_layer(config.hidden_size, 2,
+                                                    config.init_method,
+                                                    args.zero_stage == 3)
                 self._binary_head_key = 'binary_head'
 
     def set_input_tensor(self, input_tensor):
@@ -189,7 +185,7 @@ class BertModel(MegatronModule):
         )
 
         if self.post_process and self.add_binary_head:
-            lm_output, pooled_output = lm_output
+            lm_output, pooled_output, moe_losses = lm_output
 
             # Return pooled output (e.g., when computing Bert embeddings).
             if self.return_embeddings:
@@ -212,11 +208,14 @@ class BertModel(MegatronModule):
             pooled_output = None
 
         if self.post_process:
-            return post_language_model_processing(lm_output, pooled_output,
-                                                  self.lm_head, self.binary_head,
-                                                  lm_labels,
-                                                  self.word_embeddings_weight(),
-                                                  self.fp16_lm_cross_entropy)
+            if not self.add_binary_head:
+                lm_output, moe_losses = lm_output
+            lm_output = post_language_model_processing(lm_output, pooled_output,
+                                                       self.lm_head, self.binary_head,
+                                                       lm_labels,
+                                                       self.shared_embedding_or_output_weight(),
+                                                       self.fp16_lm_cross_entropy)
+            return *lm_output, moe_losses if self.return_moe_loss else lm_output
         else:
             return lm_output
 

@@ -21,11 +21,12 @@ from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 from megatron.core.enums import ModelType
+from deepspeed.accelerator import get_accelerator
 
 def process_batch(batch):
     """Process batch and produce inputs for the model."""
-    images = batch[0].cuda().contiguous()
-    labels = batch[1].cuda().contiguous()
+    images = batch[0].to(get_accelerator().device_name()).contiguous()
+    labels = batch[1].to(get_accelerator().device_name()).contiguous()
     return images, labels
 
 

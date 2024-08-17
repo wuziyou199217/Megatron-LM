@@ -1,7 +1,12 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from apex.optimizers import FusedAdam as Adam
-from apex.optimizers import FusedSGD as SGD
+from deepspeed.accelerator import get_accelerator
+if get_accelerator().device_name() == 'cuda':
+    from apex.optimizers import FusedAdam as Adam
+    from apex.optimizers import FusedSGD as SGD
+else:
+    from torch.optim import Adam
+    from torch.optim import SGD
 
 from megatron import get_args
 
@@ -50,13 +55,13 @@ def get_param_groups(modules,
 
     param_groups = []
     if len(wd_no_scale_lr):
-        param_groups.append({'params': wd_no_scale_lr, 'wd_mult': 1.0, 'lr_mult': 1.0})
+        param_groups.append({'name': 'wd_no_scale_lr', 'params': wd_no_scale_lr, 'wd_mult': 1.0, 'lr_mult': 1.0})
     if len(wd_scale_lr):
-        param_groups.append({'params': wd_scale_lr, 'wd_mult': 1.0, 'lr_mult': lr_mult})
+        param_groups.append({'name': 'wd_scale_lr', 'params': wd_scale_lr, 'wd_mult': 1.0, 'lr_mult': lr_mult})
     if len(no_wd_no_scale_lr):
-        param_groups.append({'params': no_wd_no_scale_lr, 'wd_mult': 0.0, 'lr_mult': 1.0})
+        param_groups.append({'name': 'no_wd_no_scale_lr', 'params': no_wd_no_scale_lr, 'wd_mult': 0.0, 'lr_mult': 1.0})
     if len(no_wd_scale_lr):
-        param_groups.append({'params': no_wd_scale_lr, 'wd_mult': 0.0, 'lr_mult': lr_mult})
+        param_groups.append({'name': 'no_wd_scale_lr', 'params': no_wd_scale_lr, 'wd_mult': 0.0, 'lr_mult': lr_mult})
 
     return param_groups
 
@@ -71,25 +76,48 @@ def get_megatron_optimizer(model,
                                     no_weight_decay_cond,
                                     scale_lr_cond,
                                     lr_mult)
+    if args.create_moe_param_group:
+        from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer
+        param_groups = split_params_into_different_moe_groups_for_optimizer(param_groups)
 
-    if args.optimizer == 'adam':
-        optimizer = Adam(param_groups,
-                         lr=args.lr,
-                         weight_decay=args.weight_decay,
-                         betas=(args.adam_beta1, args.adam_beta2),
-                         eps=args.adam_eps)
-    elif args.optimizer == 'sgd':
-        optimizer = SGD(param_groups,
-                        lr=args.lr,
-                        weight_decay=args.weight_decay,
-                        momentum=args.sgd_momentum)
+    if args.cpu_optimizer:
+        assert args.optimizer == 'adam', 'CPU offloading is for Adam'
+        if args.cpu_torch_adam:
+            cpu_adam_optimizer = torch.optim.AdamW
+        else:
+            from deepspeed.ops.adam import DeepSpeedCPUAdam
+            cpu_adam_optimizer = DeepSpeedCPUAdam
+        optimizer = cpu_adam_optimizer(param_groups,
+                                       lr=args.lr,
+                                       weight_decay=args.weight_decay,
+                                       betas=(args.adam_beta1, args.adam_beta2),
+                                       eps=args.adam_eps)
     else:
-        raise Exception('{} optimizer is not supported.'.format(
+        if args.optimizer == 'adam':
+            if args.ds_fused_adam:
+                global Adam
+                from deepspeed.ops.adam import FusedAdam
+                Adam = FusedAdam
+            optimizer = Adam(param_groups,
+                            lr=args.lr,
+                            weight_decay=args.weight_decay,
+                            betas=(args.adam_beta1, args.adam_beta2),
+                            eps=args.adam_eps)
+        elif args.optimizer == 'sgd':
+            optimizer = SGD(param_groups,
+                            lr=args.lr,
+                            weight_decay=args.weight_decay,
+                            momentum=args.sgd_momentum)
+        else:
+            raise Exception('{} optimizer is not supported.'.format(
             args.optimizer))
+
+    if args.deepspeed:
+        return optimizer
 
     # Determine whether the params have main-grad field.
     params_have_main_grad = False
-    if args.DDP_impl == 'local':
+    if args.use_contiguous_buffers_in_local_ddp:
         params_have_main_grad = True
 
     # Mixed precision optimizer.

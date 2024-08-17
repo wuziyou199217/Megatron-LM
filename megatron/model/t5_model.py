@@ -11,9 +11,7 @@ from megatron.model.language_model import parallel_lm_logits, get_language_model
 from megatron.model import LayerNorm
 from megatron.model.utils import (
     openai_gelu,
-    get_linear_layer,
-    init_method_normal,
-    scaled_init_method_normal
+    get_linear_layer
 )
 from .module import MegatronModule
 
@@ -43,16 +41,11 @@ class T5LMHead(MegatronModule):
 
     Arguments:
         mpu_vocab_size: model parallel size of vocabulary.
-        hidden_size: hidden size
-        init_method: init method for weight initialization
-        layernorm_epsilon: tolerance for layer norm divisions
         parallel_output: wether output logits being distributed or not.
     """
 
     def __init__(self, mpu_vocab_size, parallel_output):
         super(T5LMHead, self).__init__()
-
-        args = get_args()
 
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
         self.bias.model_parallel = True
@@ -72,41 +65,41 @@ class T5Model(MegatronModule):
     """T5 Language model."""
 
     def __init__(self,
+                 config,
                  num_tokentypes=0,
                  parallel_output=True,
                  pre_process=True,
                  post_process=True,
                  add_encoder=True,
-                 add_decoder=True):
-        super(T5Model, self).__init__()
+                 add_decoder=True,
+                 return_moe_loss=False):
+        super().__init__(config=config)
         args = get_args()
 
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
         self.parallel_output = parallel_output
-        init_method = init_method_normal(args.init_method_std)
-        scaled_init_method = scaled_init_method_normal(args.init_method_std,
-                                                       args.num_layers)
         self.pre_process = pre_process
         self.post_process = post_process
         self.add_encoder = add_encoder
         self.add_decoder = add_decoder
+        self.return_moe_loss = return_moe_loss
 
         self.language_model, self._language_model_key = get_language_model(
+            config=config,
             num_tokentypes=num_tokentypes,
             add_pooler=False,
             add_encoder=add_encoder,
             add_decoder=add_decoder,
             encoder_attn_mask_type=AttnMaskType.padding,
-            init_method=init_method,
-            scaled_init_method=scaled_init_method,
             pre_process=self.pre_process,
-            post_process=self.post_process)
+            post_process=self.post_process,
+            num_experts=args.num_experts,)
 
-        self.initialize_word_embeddings(init_method_normal)
+        self.initialize_word_embeddings()
 
         if self.post_process and self.add_decoder:
             self.lm_head = T5LMHead(
-                self.word_embeddings_weight().size(0),
+                self.shared_embedding_or_output_weight().size(0),
                 parallel_output)
             self._lm_head_key = 'lm_head'
 
@@ -136,10 +129,10 @@ class T5Model(MegatronModule):
                                         enc_hidden_states=enc_hidden_states)
 
         if self.post_process and self.add_decoder:
-            decoder_output, encoder_output = lm_output
+            decoder_output, encoder_output, dec_moe_losses, enc_moe_losses = lm_output
             # Output. [s, b, h]
             lm_logits = self.lm_head(decoder_output,
-                                     self.word_embeddings_weight())
+                                     self.shared_embedding_or_output_weight())
 
             if lm_labels is None:
                 # [s b h] => [b s h]
@@ -155,13 +148,11 @@ class T5Model(MegatronModule):
                                                                                 lm_labels)
                 # [s b] => [b s]
                 lm_loss = lm_loss.transpose(0,1).contiguous()
-            return lm_loss
+            return lm_loss, dec_moe_losses, enc_moe_losses if self.return_moe_loss else lm_loss
         elif self.add_decoder and not self.add_encoder:
-            decoder_output, encoder_output = lm_output
-            return decoder_output
-        else:
-            encoder_output = lm_output
-            return encoder_output
+            decoder_output, _, decoder_moe_losses, _= lm_output
+            return decoder_output, decoder_moe_losses
+        return lm_output
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """For easy load when model is combined with other heads,

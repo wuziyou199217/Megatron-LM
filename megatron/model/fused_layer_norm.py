@@ -9,6 +9,8 @@ import torch
 from torch.nn.parameter import Parameter
 from torch.nn import init
 import importlib
+from torch.nn import functional as F
+import inspect
 
 from megatron.core.utils import make_viewless_tensor
 
@@ -18,40 +20,11 @@ try:
 except:
     HAVE_PERSIST_LAYER_NORM = False
 
-global fused_mix_prec_layer_norm_cuda
-fused_mix_prec_layer_norm_cuda = None
+from apex.normalization.fused_layer_norm import FusedLayerNormAffineFunction
 
 
-class FusedLayerNormAffineFunction(torch.autograd.Function):
-
-  @staticmethod
-  def forward(ctx, input, weight, bias, normalized_shape, eps):
-
-    ctx.normalized_shape = normalized_shape
-    ctx.eps = eps
-    input_ = input.contiguous()
-    weight_ = weight.contiguous()
-    bias_ = bias.contiguous()
-    output, mean, invvar = fused_mix_prec_layer_norm_cuda.forward_affine(
-        input_, ctx.normalized_shape, weight_, bias_, ctx.eps)
-    ctx.save_for_backward(input_, weight_, bias_, mean, invvar)
-
-    return output
-
-
-  @staticmethod
-  def backward(ctx, grad_output):
-
-    input_, weight_, bias_, mean, invvar = ctx.saved_tensors
-    grad_input = grad_weight = grad_bias = None
-    grad_input, grad_weight, grad_bias \
-      = fused_mix_prec_layer_norm_cuda.backward_affine(
-        grad_output.contiguous(), mean, invvar,
-        input_, ctx.normalized_shape,
-        weight_, bias_, ctx.eps)
-
-    return grad_input, grad_weight, grad_bias, None, None
-
+global fused_layer_norm_cuda
+fused_layer_norm_cuda = None
 
 
 class MixedFusedLayerNorm(torch.nn.Module):
@@ -59,14 +32,15 @@ class MixedFusedLayerNorm(torch.nn.Module):
   def __init__(self, normalized_shape, eps=1e-5,
                no_persist_layer_norm=True,
                sequence_parallel=False,
-               apply_layernorm_1p=False):
+               apply_layernorm_1p=False,
+               mem_efficient_ln=True):
         super(MixedFusedLayerNorm, self).__init__()
 
         self.apply_layernorm_1p = apply_layernorm_1p
+        self.mem_efficient_ln = mem_efficient_ln
 
-        global fused_mix_prec_layer_norm_cuda
-        fused_mix_prec_layer_norm_cuda = importlib.import_module(
-          "fused_mix_prec_layer_norm_cuda")
+        global fused_layer_norm_cuda
+        fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
 
         # List of hiddens sizes supported in the persistent layer norm kernel
         # If the hidden size is not supported, fall back to the non-persistent
@@ -87,7 +61,7 @@ class MixedFusedLayerNorm(torch.nn.Module):
         self.reset_parameters()
         self.no_persist_layer_norm = no_persist_layer_norm
         self.sequence_parallel = sequence_parallel
-        
+
         # set sequence parallelism flag on weight and bias parameters
         setattr(self.weight, 'sequence_parallel', self.sequence_parallel)
         setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
@@ -105,9 +79,19 @@ class MixedFusedLayerNorm(torch.nn.Module):
   def forward(self, input):
 
     weight = self.weight + 1 if self.apply_layernorm_1p else self.weight
+    # CPU path is here for unittest sake.
+    if not input.is_cuda:
+        print("WARNING! The input of FusedLayerNorm should be on the GPU."
+              "This warning should only be triggered in the FusedLayerNorm unit tests.")
+        return F.layer_norm(input, self.normalized_shape, weight, self.bias, self.eps)
 
     if self.no_persist_layer_norm:
-        return FusedLayerNormAffineFunction.apply(input, weight, self.bias, self.normalized_shape, self.eps)
+        # Apex does not have versions yet (https://github.com/NVIDIA/apex/pull/1648), so we need to inspect 
+        # the function manually on whether the extra arg introduced in https://github.com/NVIDIA/apex/pull/1715 exists yet
+        if 'memory_efficient' in inspect.getfullargspec(FusedLayerNormAffineFunction.forward).args:
+            return FusedLayerNormAffineFunction.apply(input, weight, self.bias, self.normalized_shape, self.eps, self.mem_efficient_ln)
+        else:
+            return FusedLayerNormAffineFunction.apply(input, weight, self.bias, self.normalized_shape, self.eps)
     else:
         output = FastLayerNormFN.apply(input, weight, self.bias, self.eps)
 

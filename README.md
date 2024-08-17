@@ -1,3 +1,18 @@
+## Latest News
+* [2023/07] Synced with [upstream](https://github.com/NVIDIA/Megatron-LM) over 1k commits, see [rebase folder for more details](https://github.com/microsoft/Megatron-DeepSpeed/tree/main/examples_deepspeed/rebase) in terms of features and updated performance.
+
+## Megatron-DeepSpeed
+DeepSpeed version of NVIDIA's Megatron-LM that adds additional support for several features such as MoE model training, Curriculum Learning, 3D Parallelism, and others. The ```examples_deepspeed/``` folder includes example scripts about the features supported by DeepSpeed.
+
+### Recent sync with NVIDIA/Megatron-LM
+In July 2023, we had a sync with the NVIDIA/Megatron-LM repo (where this repo is forked from) by git-merging 1100+ commits. Details can be found in the ```examples_deepspeed/rebase``` folder. Given the amount of merged commits, bugs can happen in the cases that we haven't tested, and your contribution (bug report, bug fix pull request) is highly welcomed. We also created a [backup branch](https://github.com/microsoft/Megatron-DeepSpeed/tree/before_rebase) which is the version before this sync. This backup branch is just for comparison tests and for temporary use when you need to debug the main branch. We do not plan to continue supporting the version before sync.
+
+### Run on Azure and AzureML
+To try out DeepSpeed on Azure, this fork of Megatron offers easy-to-use recipes and bash scripts. We strongly recommend to start with AzureML recipe in the ```examples_deepspeed/azureml``` folder. If you have a custom infrastructure (e.g. HPC clusters) or Azure VM based environment, please refer to the bash scripts in the ```examples_deepspeed/azure``` folder. 
+
+Below is Megatron-LM's original README. Note that examples mentioned below are from the original NVIDIA/Megatron-LM repo. All of them do NOT have DeepSpeed technologies integrations, and some of them may not work due to changes in this Megatron-DeepSpeed repo. Thus we recommend you to go to ```../examples_deepspeed/``` folder which includes examples that have DeepSpeed technologies integrated and are tested by DeepSpeed team.
+------
+
 Megatron ([1](https://arxiv.org/pdf/1909.08053.pdf), [2](https://arxiv.org/pdf/2104.04473.pdf), and [3](https://arxiv.org/pdf/2205.05198)) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research on training large transformer language models at scale. We developed efficient, model-parallel ([tensor](https://arxiv.org/pdf/1909.08053.pdf), [sequence](https://arxiv.org/pdf/2205.05198), and [pipeline](https://arxiv.org/pdf/2104.04473.pdf)), and multi-node pre-training of transformer based models such as [GPT](https://arxiv.org/abs/2005.14165), [BERT](https://arxiv.org/pdf/1810.04805.pdf), and [T5](https://arxiv.org/abs/1910.10683) using mixed precision.
 
 Below are some of the projects where we have directly used Megatron:
@@ -56,6 +71,7 @@ The following table shows both model (MFU) and hardware (HFU) FLOPs utilization 
    * [Datasets](#datasets)
       * [Collecting Wikipedia Training Data](#collecting-wikipedia-training-data)
       * [Collecting GPT Webtext Data](#collecting-gpt-webtext-data)
+   * [Reproducibility](#reproducibility)
 
 # Setup
 We strongly recommend using the latest release of [NGC's PyTorch container](https://ngc.nvidia.com/catalog/containers/nvidia:pytorch) with DGX nodes. If you can't use this for some reason, use the latest pytorch, cuda, nccl, and NVIDIA [APEX](https://github.com/NVIDIA/apex#quick-start) releases.  Data preprocessing requires [NLTK](https://www.nltk.org/install.html), though this is not required for training, evaluation, or downstream tasks.
@@ -79,6 +95,13 @@ GPT-345M: wget --content-disposition https://api.ngc.nvidia.com/v2/models/nvidia
 
 The models require vocabulary files to run. The BERT  WordPiece vocab file can be extracted from Google's pretrained BERT models: [uncased](https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-uncased-vocab.txt), [cased](https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-cased-vocab.txt). The GPT [vocab file](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-vocab.json) and [merge table](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-merges.txt) can be downloaded directly.
 
+Additional notes for DeepSpeed. We have added a helper script to download the checkpoints and make the example runnable.
+
+Steps to follow:
+ - bash dataset/download_ckpt.sh -- this will download and extract the checkpoint
+ - bash dataset/download_vocab.sh -- this will download GPT merges and vocab files.
+ - bash examples/generate_text.sh -- this will generate examples using the 345m GPT model.
+
 # Usage
 
 After installation, there are several possible workflows. The most comprehensive is:
@@ -101,15 +124,15 @@ The training data requires preprocessing. First, place your training data in a l
 
 The name of the `text` field of the json can be changed by using the `--json-key` flag in [`preprocess_data.py`](./tools/preprocess_data.py) The other metadata are optional and are not used in training.
 
-The loose json is then processed into a binary format for training. To convert the json into mmap, cached index file, or the lazy loader format use `preprocess_data.py`. Set the `--dataset-impl` flag to `mmap`, `cached`, or `lazy`, respectively (default is `mmap`). An example script to prepare data for BERT training is:
+The loose json is then processed into a binary format for training. To convert the json into mmap format use `preprocess_data.py`. An example script to prepare data for BERT training is:
 <pre>
 python tools/preprocess_data.py \
        --input my-corpus.json \
        --output-prefix my-bert \
-       --vocab bert-vocab.txt \
-       --dataset-impl mmap \
+       --vocab-file bert-vocab.txt \
        --tokenizer-type BertWordPieceLowerCase \
-       --split-sentences
+       --split-sentences \
+       --workers 5
 </pre>
 
 The output will be two files named, in this case, `my-bert_text_sentence.bin` and `my-bert_text_sentence.idx`. The `--data-path` specified in later BERT training is the full path and new filename, but without the file extension.
@@ -124,11 +147,12 @@ Some minor modifications are required for GPT data preprocessing, namely, the ad
 python tools/preprocess_data.py \
        --input my-corpus.json \
        --output-prefix my-gpt2 \
-       --vocab gpt2-vocab.json \
+       --vocab-file gpt2-vocab.json \
        --dataset-impl mmap \
        --tokenizer-type GPT2BPETokenizer \
        --merge-file gpt2-merges.txt \
-       --append-eod
+       --append-eod \
+       --workers 5
 </pre>
 
 Here the output files are named `my-gpt2_text_document.bin` and `my-gpt2_text_document.idx`. As before, in GPT training, use the longer name without the extension as `--data-path`.
@@ -365,7 +389,7 @@ See [megatron/text_generation_server.py](megatron/text_generation_server.py) for
 ### Detoxify GPT via Self-generation
 We include an example in `examples/detxoify_lm/` to detoxify language models by leveraging the generative power of language models.
 
-See [examples/detxoify_lm/README.md](examples/detxoify_lm/README.md) for step-by-step tutorials on how to perform domain-adaptive training and detoxify LM using self-generated corpus. 
+See [examples/detxoify_lm/README.md](examples/detxoify_lm/README.md) for step-by-step tutorials on how to perform domain-adaptive training and detoxify LM using self-generated corpus.
 
 
 ## GPT Evaluation
@@ -513,3 +537,13 @@ We recommend using the `--json` argument when using WikiExtractor, which will du
 
 ## Collecting GPT Webtext Data
 We utilize the publicly available [OpenWebText](https://github.com/eukaryote31/openwebtext) library from [jcpeterson](https://github.com/jcpeterson/openwebtext) and [eukaryote31's](https://github.com/eukaryote31/openwebtext) work to download urls. We then filtered, cleaned, and deduplicated all downloaded content according to the procedure described in our [openwebtext](./tools/openwebtext) directory. For reddit URLs corresponding to content up to October 2018 we arrived at approximately 37GB of content.
+
+# Reproducibility
+Megatron training is intended to be bitwise reproducible. This means that the same training config run twice in the same HW and SW environment should produce identical model checkpoints, losses and accuracy metric values (iteration time metrics may vary).
+
+There are currently three known Megatron optimizations that break reproducibility whilst still producing almost identical training runs. They are only applicable when using NGC containers >=22.05. The following workarounds should be applied in cases where reproducibility is required:
+1. When training using the `--bf16` option the backward pass of `torch.nn.functional.embedding` is non-deterministic. If reproducibility is required you should also use the option `--embedding-weights-in-fp32`. The speed and memory impact of this change is negligible.
+2. Also when training using `--bf16`, reproducbility is only obtained when the checkpointing and resume schedule of training is identical. If the checkpointing schedule will change, i.e. checkpointing and resume will occur at different iterations, the option `--no-bias-gelu-fusion` should be used.
+3. Flash attention is non-deterministic. If reproducibility is required do not use `--use-flash-attn`.
+
+These sources of non-determinism are under active investigation. If you observe non-determinism in Megatron training under other circumstances please open an issue.

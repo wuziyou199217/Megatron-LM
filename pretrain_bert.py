@@ -4,6 +4,7 @@
 
 from functools import partial
 
+import math
 import torch
 import torch.nn.functional as F
 
@@ -16,6 +17,7 @@ from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.model import BertModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
+from megatron.arguments import core_transformer_config_from_args
 
 
 def model_provider(pre_process=True, post_process=True):
@@ -24,8 +26,10 @@ def model_provider(pre_process=True, post_process=True):
     print_rank_0('building BERT model ...')
 
     args = get_args()
+    config = core_transformer_config_from_args(args)
     num_tokentypes = 2 if args.bert_binary_head else 0
     model = BertModel(
+        config=config,
         num_tokentypes=num_tokentypes,
         add_binary_head=args.bert_binary_head,
         parallel_output=True,
@@ -59,9 +63,31 @@ def get_batch(data_iterator):
 
     return tokens, types, sentence_order, loss_mask, lm_labels, padding_mask
 
+def data_post_process(data, data_sampler_state_dict):
+    args = get_args()
+    if args.data_efficiency_curriculum_learning:
+        if 'seqlen_truncate' in data_sampler_state_dict['current_difficulties']:
+            effective_seqlen = data_sampler_state_dict['current_difficulties']['seqlen_truncate']
+        else:
+            effective_seqlen = torch.count_nonzero(data['padding_mask'], dim=1)
+            effective_seqlen = torch.max(effective_seqlen).to(torch.cuda.current_device())
+            torch.distributed.all_reduce(effective_seqlen,
+                op=torch.distributed.ReduceOp.MAX,
+                group=mpu.get_data_parallel_group())
+            effective_seqlen = effective_seqlen.item()
+        # Has to be multiple of 8 to enable Tensor Core acceleration
+        if effective_seqlen % 8 != 0:
+            effective_seqlen = math.ceil(effective_seqlen / 8) * 8
+        if effective_seqlen < args.seq_length:
+            data['text'] = data['text'][:, :effective_seqlen].contiguous()
+            data['types'] = data['types'][:, :effective_seqlen].contiguous()
+            data['loss_mask'] = data['loss_mask'][:, :effective_seqlen].contiguous()
+            data['labels'] = data['labels'][:, :effective_seqlen].contiguous()
+            data['padding_mask'] = data['padding_mask'][:, :effective_seqlen].contiguous()
+    return data
 
 def loss_func(loss_mask, sentence_order, output_tensor):
-    lm_loss_, sop_logits = output_tensor
+    lm_loss_, sop_logits, _ = output_tensor
 
     lm_loss_ = lm_loss_.float()
     loss_mask = loss_mask.float()
@@ -96,6 +122,9 @@ def forward_step(data_iterator, model):
     tokens, types, sentence_order, loss_mask, lm_labels, padding_mask = get_batch(
         data_iterator)
     timers('batch-generator').stop()
+
+    if args.data_efficiency_curriculum_learning:
+        args.curriculum_seqlen = tokens.size()[1]
 
     if not args.bert_binary_head:
         types = None
@@ -133,4 +162,5 @@ if __name__ == "__main__":
 
     pretrain(train_valid_test_datasets_provider, model_provider,
              ModelType.encoder_or_decoder,
-             forward_step, args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+             forward_step, args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'},
+             data_post_process=data_post_process)

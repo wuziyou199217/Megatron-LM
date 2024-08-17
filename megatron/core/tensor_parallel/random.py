@@ -7,9 +7,11 @@ import contextlib
 
 import torch
 from torch import _C
-from torch.cuda import _lazy_call, device as device_ctx_manager
+from deepspeed.accelerator import get_accelerator
 from torch.utils.checkpoint import detach_variable
 
+from megatron import get_args
+from megatron.memory import allocate_mem_buff
 from megatron.core.parallel_state import (
     get_data_parallel_rank,
     get_tensor_model_parallel_group,
@@ -24,9 +26,40 @@ from .utils import (
 
 from megatron.core.utils import safely_set_viewless_tensor_data
 
+import deepspeed
+
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 
+# Whether apply model parallelsim to checkpointed hidden states.
+_CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER = None
+
+
+def init_checkpointed_activations_memory_buffer():
+    """Initializ the memory buffer for the checkpointed activations."""
+    args = get_args()
+
+    per_layer = args.micro_batch_size * args.max_position_embeddings * \
+                args.hidden_size // args.tensor_model_parallel_size
+    assert args.num_layers % args.checkpoint_num_layers == 0, \
+        'number of layers is not divisible by checkpoint-num-layers'
+    num_checkpointer_layers = args.num_layers // args.checkpoint_num_layers
+    numel = per_layer * num_checkpointer_layers
+    dtype = torch.half
+    if not args.fp16:
+        dtype = torch.float
+
+    global _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER
+    assert _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is None, \
+        'checkpointed activations memory buffer is already allocated.'
+    _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER = allocate_mem_buff(
+        'checkpointed activations', numel, dtype, track_usage=False)
+
+
+def reset_checkpointed_activations_memory_buffer():
+    """Reset the memory used for checkpointing."""
+    if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
+        _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER.reset()
 
 def _set_cuda_rng_state(new_state, device=-1):
     """Sets the random number generator state of the current GPU.
@@ -40,25 +73,25 @@ def _set_cuda_rng_state(new_state, device=-1):
     if hasattr(_C, '_cuda_setRNGState') and callable(_C._cuda_setRNGState):
         # older PyTorch
         def cb():
-            with device_ctx_manager(device):
+            with get_accelerator().device(device):
                 _C._cuda_setRNGState(new_state)
     else:
         # newer PyTorch
         if device == -1:
-            device = torch.device('cuda')
+            device = torch.device(get_accelerator().device_name())
         elif isinstance(device, str):
             device = torch.device(device)
         elif isinstance(device, int):
-            device = torch.device('cuda', device)
+            device = torch.device(get_accelerator().device_name(), device)
 
         def cb():
             idx = device.index
             if idx is None:
-                idx = torch.cuda.current_device()
-            default_generator = torch.cuda.default_generators[idx]
+                idx = get_accelerator().current_device()
+            default_generator = get_accelerator().default_generator(idx)
             default_generator.set_state(new_state)
 
-    _lazy_call(cb)
+    get_accelerator().lazy_call(cb)
 
 
 
@@ -105,10 +138,10 @@ class CudaRNGStatesTracker:
         if name in self.states_:
             raise Exception('cuda rng state {} already exists'.format(name))
         # Get the current rng state.
-        orig_rng_state = torch.cuda.get_rng_state()
+        orig_rng_state = get_accelerator().get_rng_state()
         # Set the new state and store it.
-        torch.cuda.manual_seed(seed)
-        self.states_[name] = torch.cuda.get_rng_state()
+        get_accelerator().manual_seed(seed)
+        self.states_[name] = get_accelerator().get_rng_state()
         # Reset rng state to what it was.
         _set_cuda_rng_state(orig_rng_state)
 
@@ -118,9 +151,10 @@ class CudaRNGStatesTracker:
         the original state."""
         # Check if we have added the state
         if name not in self.states_:
+            print(name, self.states_)
             raise Exception('cuda rng state {} is not added'.format(name))
         # Store current rng state.
-        orig_cuda_rng_state = torch.cuda.get_rng_state()
+        orig_cuda_rng_state = get_accelerator().get_rng_state()
         # Set rng state to the desired one
         _set_cuda_rng_state(self.states_[name])
         # Do the stuff we wanted to do.
@@ -128,7 +162,7 @@ class CudaRNGStatesTracker:
             yield
         finally:
             # Update the current rng state for later use.
-            self.states_[name] = torch.cuda.get_rng_state()
+            self.states_[name] = get_accelerator().get_rng_state()
             # And set the state to the original state we started with.
             _set_cuda_rng_state(orig_cuda_rng_state)
 
@@ -136,9 +170,11 @@ class CudaRNGStatesTracker:
 # RNG tracker object.
 _CUDA_RNG_STATE_TRACKER = CudaRNGStatesTracker()
 
-
 def get_cuda_rng_tracker():
     """Get cuda rng tracker."""
+    if deepspeed.checkpointing.is_configured():
+        return deepspeed.checkpointing.get_cuda_rng_tracker()
+    
     return _CUDA_RNG_STATE_TRACKER
 
 
@@ -159,18 +195,37 @@ def model_parallel_cuda_manual_seed(seed):
                               groups. This is used for example for dropout in
                               model parallel regions.
     """
+    if deepspeed.checkpointing.is_configured():
+        return deepspeed.checkpointing.model_parallel_cuda_manual_seed(seed)
+    
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
     tensor_model_parallel_seed = offset + get_tensor_model_parallel_rank()
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
+    if torch.distributed.get_rank() == 0:
+        print('> initializing model parallel cuda seeds on global rank {}, '
+              'model parallel rank {}, and data parallel rank {} with '
+              'model parallel seed: {} and data parallel seed: {}'.format(
+                  torch.distributed.get_rank(), get_tensor_model_parallel_rank(),
+                  get_data_parallel_rank(), tensor_model_parallel_seed,
+                  data_parallel_seed), flush=True)
     _CUDA_RNG_STATE_TRACKER.reset()
     # Set the default state.
-    torch.cuda.manual_seed(data_parallel_seed)
+    get_accelerator().manual_seed(data_parallel_seed)
     # and model parallel state.
     _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME,
                                 tensor_model_parallel_seed)
+
+
+def model_parallel_reconfigure_tp_seed(seed):
+    if deepspeed.checkpointing.is_configured():
+        return deepspeed.checkpointing.model_parallel_reconfigure_tp_seed(seed)
+
+    model_parallel_seed = seed + 2718 + get_tensor_model_parallel_rank()
+    with _CUDA_RNG_STATE_TRACKER.fork():
+        get_accelerator().manual_seed(model_parallel_seed)
 
 
 class CheckpointFunction(torch.autograd.Function):
@@ -188,7 +243,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         # Copy the rng states.
         ctx.fwd_cpu_rng_state = torch.get_rng_state()
-        ctx.fwd_cuda_rng_state = torch.cuda.get_rng_state()
+        ctx.fwd_cuda_rng_state = get_accelerator().get_rng_state()
         ctx.fwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
 
         with torch.no_grad():
@@ -201,6 +256,15 @@ class CheckpointFunction(torch.autograd.Function):
             safely_set_viewless_tensor_data(
                 args[0],
                 split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True))
+
+        # HACK: currently when DeepSpeed is used, we always set
+        # distribute_saved_activations to false, and use the following older
+        # activation checkpointing mechanisms
+        if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
+            ctx.input_0_shape = args[0].data.shape
+            args[0].data = split_tensor_into_1d_equal_chunks(args[0].data)
+            args[0].data = _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER.add(
+                args[0].data)
 
         # Store everything.
         ctx.save_for_backward(*args)
@@ -217,10 +281,16 @@ class CheckpointFunction(torch.autograd.Function):
             safely_set_viewless_tensor_data(
                 inputs[0],
                 gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape))
+        # HACK: currently when DeepSpeed is used, we always set
+        # distribute_saved_activations to false, and use the following older
+        # activation checkpointing mechanisms
+        if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
+            inputs[0].data = gather_split_1d_tensor(inputs[0].data)
+            inputs[0].data = inputs[0].data.view(ctx.input_0_shape)
 
         # Store the current states.
         bwd_cpu_rng_state = torch.get_rng_state()
-        bwd_cuda_rng_state = torch.cuda.get_rng_state()
+        bwd_cuda_rng_state = get_accelerator().get_rng_state()
         bwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
 
         # Set the states to what it used to be before the forward pass.
@@ -240,6 +310,10 @@ class CheckpointFunction(torch.autograd.Function):
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
+        elif len(outputs) == 2 and isinstance(outputs[1], torch.Tensor) and \
+                torch.equal(outputs[1], torch.tensor(0).to(get_accelerator().device_name())):
+            # a hacky solution to overcome issue when running old script examples/pretrain_gpt_distributed.sh
+            outputs = (outputs[0],)
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp
                       for inp in detached_inputs)
@@ -249,5 +323,8 @@ class CheckpointFunction(torch.autograd.Function):
 def checkpoint(function, distribute_saved_activations, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
+    if deepspeed.checkpointing.is_configured():
+        return deepspeed.checkpointing.checkpoint(function, *args)
+    
     return CheckpointFunction.apply(function,
                                     distribute_saved_activations, *args)

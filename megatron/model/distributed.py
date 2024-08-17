@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC
 from abc import abstractmethod
@@ -10,7 +10,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from megatron import get_args
 from megatron.core import mpu
 from .module import MegatronModule
-
+from deepspeed.accelerator import get_accelerator
 
 class MemoryBuffer:
 
@@ -20,7 +20,7 @@ class MemoryBuffer:
         self.dtype = dtype
         self.data = torch.zeros(self.numel_padded,
                                 dtype=self.dtype,
-                                device=torch.cuda.current_device(),
+                                device=get_accelerator().current_device_name(),
                                 requires_grad=False)
 
     def zero(self):
@@ -217,7 +217,6 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     if tp not in buckets:
                         buckets[tp] = []
                     buckets[tp].append(param)
-                    param.main_grad = param.grad
 
             # For each bucket, all-reduce and copy all-reduced grads.
             for tp in buckets:

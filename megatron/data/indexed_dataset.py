@@ -10,6 +10,9 @@
 # Added document index to index file and made it accessible.
 #    An empty sentence no longer separates documents.
 
+# Some of the fixes/improvements are adopted from
+# https://github.com/bigscience-workshop/Megatron-DeepSpeed/blob/main/megatron/data/indexed_dataset.py
+
 from functools import lru_cache
 import os
 import shutil
@@ -95,9 +98,9 @@ dtypes = {
     3: np.int16,
     4: np.int32,
     5: np.int64,
-    6: np.float,
-    7: np.double,
-    8: np.uint16
+    6: np.float64,
+    7: np.float32,
+    8: np.uint16,
 }
 
 
@@ -268,8 +271,8 @@ class IndexedDatasetBuilder(object):
         np.int16: 2,
         np.int32: 4,
         np.int64: 8,
-        np.float: 4,
-        np.double: 8
+        np.float32: 4,
+        np.float64: 8,
     }
 
     def __init__(self, out_file, dtype=np.int32):
@@ -337,6 +340,38 @@ def _warmup_mmap_file(path):
             pass
 
 
+def exscan_from_cumsum_(arr):
+    # given an array holding the result of an inclusive scan (cumsum),
+    # convert to an exclusive scan (shift to the right)
+    # [10, 30, 35, 50] --> [0, 10, 30, 35]
+    if arr.size > 1:
+        arr[1:] = arr[:-1]
+    if arr.size > 0:
+        arr[0] = 0
+
+
+def get_pointers_with_total(sizes, elemsize, dtype):
+    """Return a numpy array of type np.dtype giving the byte offsets.
+
+    Multiplies values in the sizes array by elemsize (bytes),
+    and then computes an exclusive scan to get byte offsets.
+    Returns the total number of bytes as second item in a tuple.
+    """
+
+    # scale values in sizes array by elemsize to get sizes in bytes
+    pointers = np.array(sizes, dtype=dtype)
+    pointers *= elemsize
+    np.cumsum(pointers, axis=0, out=pointers)
+
+    # get total number of bytes from all sizes (last element)
+    bytes_last = pointers[-1] if len(sizes) > 0 else 0
+
+    # convert to byte offsets
+    exscan_from_cumsum_(pointers)
+
+    return pointers, bytes_last
+
+
 class MMapIndexedDataset(torch.utils.data.Dataset):
     class Index(object):
         _HDR_MAGIC = b'MMIDIDX\x00\x00'
@@ -354,28 +389,27 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
                     return self
 
                 @staticmethod
-                def _get_pointers(sizes):
-                    dtype_size = dtype().itemsize
-                    address = 0
-                    pointers = []
+                def _get_pointers(sizes, npdtype):
+                    """Return a numpy array of byte offsets given a list of sizes.
 
-                    for size in sizes:
-                        pointers.append(address)
-                        address += size * dtype_size
+                    Multiplies values in the sizes array by dtype size (bytes),
+                    and then computes an exclusive scan to get byte offsets.
+                    """
 
+                    # compute element sizes in bytes
+                    pointers, _ = get_pointers_with_total(sizes, dtype().itemsize, npdtype)
                     return pointers
 
                 def write(self, sizes, doc_idx):
-                    pointers = self._get_pointers(sizes)
-
                     self._file.write(struct.pack('<Q', len(sizes)))
                     self._file.write(struct.pack('<Q', len(doc_idx)))
 
-                    sizes = np.array(sizes, dtype=np.int32)
-                    self._file.write(sizes.tobytes(order='C'))
-                    del sizes
+                    sizes32 = np.array(sizes, dtype=np.int32)
+                    self._file.write(sizes32.tobytes(order='C'))
+                    del sizes32
 
-                    pointers = np.array(pointers, dtype=np.int64)
+                    pointers = self._get_pointers(sizes, np.int64)
+                    del sizes
                     self._file.write(pointers.tobytes(order='C'))
                     del pointers
 
@@ -522,6 +556,9 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
     def sizes(self):
         return self._index.sizes
 
+    def size(self, index):
+        return self._index.sizes[index]
+
     @property
     def doc_idx(self):
         return self._index.doc_idx
@@ -541,6 +578,10 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
         return (
             os.path.exists(index_file_path(path)) and os.path.exists(data_file_path(path))
         )
+
+    @property
+    def dtype(self):
+        return self._index.dtype
 
 
 class MMapIndexedDatasetBuilder(object):

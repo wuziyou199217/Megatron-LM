@@ -163,7 +163,7 @@ class FusedScaleMaskSoftmax(nn.Module):
             if 0 <= sk <= 4096:
                 batch_per_block = self.get_batch_per_block(sq, sk, b, np)
 
-                if self.attn_mask_type == AttnMaskType.causal:
+                if self.attn_mask_type.value == AttnMaskType.causal.value:
                     if attn_batches % batch_per_block == 0:
                         return True
                 else:
@@ -175,7 +175,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         b, np, sq, sk = input.size()
         scale = self.scale if self.scale is not None else 1.0
 
-        if self.attn_mask_type == AttnMaskType.causal:
+        if self.attn_mask_type.value == AttnMaskType.causal.value:
             assert sq == sk, "causal mask is only for self attention"
 
             # input is 3D tensor (attn_batches, sq, sk)

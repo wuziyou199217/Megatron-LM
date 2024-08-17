@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron Module"""
@@ -5,15 +6,14 @@
 import torch
 from torch.autograd import Variable
 from torch.nn.parameter import Parameter
-
+from deepspeed.accelerator import get_accelerator
 from megatron import get_args
 from megatron.core import mpu, tensor_parallel
 
 
-_FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
-_HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
-_BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
-
+_FLOAT_TYPES = None
+_HALF_TYPES = None
+_BF16_TYPES = None
 
 
 def param_is_not_shared(param):
@@ -25,9 +25,10 @@ class MegatronModule(torch.nn.Module):
     """Megatron specific extensions of torch Module with support
     for pipelining."""
 
-    def __init__(self, share_word_embeddings=True):
+    def __init__(self, config=None, share_embeddings_and_output_weights=True):
         super(MegatronModule, self).__init__()
-        self.share_word_embeddings = share_word_embeddings
+        self.config = config
+        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
 
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
@@ -36,21 +37,21 @@ class MegatronModule(torch.nn.Module):
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
 
 
-    def word_embeddings_weight(self):
+    def shared_embedding_or_output_weight(self):
         if self.pre_process:
             return self.language_model.embedding.word_embeddings.weight
         else:
-            if not self.share_word_embeddings:
-                raise Exception('word_embeddings_weight() called for last '
-                                'stage, but share_word_embeddings is false')
+            if not self.share_embeddings_and_output_weights:
+                raise Exception('shared_embedding_or_output_weight() called for last '
+                                'stage, but share_embeddings_and_output_weights is false')
             return self.word_embeddings.weight
 
 
-    def initialize_word_embeddings(self, init_method_normal):
+    def initialize_word_embeddings(self):
         args = get_args()
-        if not self.share_word_embeddings:
+        if not self.share_embeddings_and_output_weights:
             raise Exception('initialize_word_embeddings() was called but '
-                            'share_word_embeddings is false')
+                            'share_embeddings_and_output_weights is false')
 
         # This function just initializes the word embeddings in the final stage
         # when we are using pipeline parallelism. Nothing to do if we aren't
@@ -76,11 +77,8 @@ class MegatronModule(torch.nn.Module):
             # set word_embeddings weights to 0 here, then copy first
             # stage's weights using all_reduce below.
             self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-                args.padded_vocab_size, args.hidden_size,
-                init_method=init_method_normal(args.init_method_std),
-                params_dtype=args.params_dtype,
-                use_cpu_initialization=args.use_cpu_initialization,
-                perform_initialization=args.perform_initialization)
+                args.padded_vocab_size, self.config.hidden_size,
+                config=self.config, init_method=self.config.init_method)
             self.word_embeddings.weight.data.fill_(0)
             self.word_embeddings.weight.shared = True
 
@@ -103,7 +101,7 @@ class MegatronModule(torch.nn.Module):
         # Ensure that first and last stages have the same initial parameter
         # values.
         if mpu.is_rank_in_embedding_group():
-            torch.distributed.all_reduce(self.word_embeddings_weight().data,
+            torch.distributed.all_reduce(self.shared_embedding_or_output_weight().data,
                                          group=mpu.get_embedding_group())
 
         # Ensure that encoder(first stage) and decoder(split stage) position
@@ -117,6 +115,8 @@ class MegatronModule(torch.nn.Module):
             torch.distributed.all_reduce(position_embeddings.weight.data,
                                          group=mpu.get_position_embedding_group())
 
+    def universal_checkpoint_info(self):
+        return {}
 
 def conversion_helper(val, conversion):
     """Apply conversion to val. Recursively apply conversion if `val`
@@ -131,11 +131,14 @@ def conversion_helper(val, conversion):
 
 def fp32_to_float16(val, float16_convertor):
     """Convert fp32 `val` to fp16/bf16"""
+    global _FLOAT_TYPES
+    if _FLOAT_TYPES is None:
+        _FLOAT_TYPES = [get_accelerator().FloatTensor(0).dtype]
     def half_conversion(val):
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):
             val_typecheck = val.data
-        if isinstance(val_typecheck, _FLOAT_TYPES):
+        if val_typecheck.dtype in _FLOAT_TYPES:
             val = float16_convertor(val)
         return val
     return conversion_helper(val, half_conversion)
@@ -143,11 +146,16 @@ def fp32_to_float16(val, float16_convertor):
 
 def float16_to_fp32(val):
     """Convert fp16/bf16 `val` to fp32"""
+    global _HALF_TYPES, _BF16_TYPES
+    if _HALF_TYPES is None:
+        _HALF_TYPES = [get_accelerator().HalfTensor(0).dtype]
+    if _BF16_TYPES is None:
+        _BF16_TYPES = [get_accelerator().BFloat16Tensor(0).dtype]
     def float_conversion(val):
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):
             val_typecheck = val.data
-        if isinstance(val_typecheck, (_BF16_TYPES, _HALF_TYPES)):
+        if val_typecheck.dtype in _BF16_TYPES + _HALF_TYPES:
             val = val.float()
         return val
     return conversion_helper(val, float_conversion)

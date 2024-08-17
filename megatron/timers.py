@@ -7,7 +7,8 @@ from abc import abstractmethod
 import time
 
 import torch
-
+from deepspeed.accelerator import get_accelerator
+from packaging import version
 
 
 class TimerBase(ABC):
@@ -81,7 +82,7 @@ class Timer(TimerBase):
         assert not self._started, 'timer has already been started'
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
-        torch.cuda.synchronize()
+        get_accelerator().synchronize()
         self._start_time = time.time()
         self._started = True
 
@@ -91,7 +92,7 @@ class Timer(TimerBase):
         assert self._started, 'timer is not started'
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
-        torch.cuda.synchronize()
+        get_accelerator().synchronize()
         self._elapsed += (time.time() - self._start_time)
         self._started = False
 
@@ -186,7 +187,7 @@ class Timers:
         # it should be ok to use all-gather instead of gather.
         rank_name_to_time = torch.zeros((world_size, len(names)),
                                         dtype=torch.float,
-                                        device=torch.cuda.current_device())
+                                        device=get_accelerator().current_device_name())
         for i, name in enumerate(names):
             if name in self._timers:
                 # Here we don't need to pass the barrier flag as all
@@ -197,8 +198,12 @@ class Timers:
                     reset=reset)
 
         # See the note above for why we are not using gather.
-        torch.distributed._all_gather_base(rank_name_to_time.view(-1),
+        if version.parse(torch.__version__) >= version.parse('1.13'):
+            torch.distributed.all_gather_into_tensor(rank_name_to_time.view(-1),
                                            rank_name_to_time[rank, :].view(-1))
+        else:
+            torch.distributed._all_gather_base(rank_name_to_time.view(-1),
+                                         rank_name_to_time[rank, :].view(-1))
 
         return rank_name_to_time
 
@@ -298,7 +303,7 @@ class Timers:
         assert normalizer > 0.0
         name_to_min_max_time = self._get_global_min_max_time(
             names, reset, barrier, normalizer)
-        if writer is not None:
+        if writer.is_enabled():
             for name in name_to_min_max_time:
                 _, max_time = name_to_min_max_time[name]
                 writer.add_scalar(name + '-time', max_time, iteration)

@@ -1,11 +1,9 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron optimizer."""
 
 from abc import ABC
 from abc import abstractmethod
-from apex.multi_tensor_apply import multi_tensor_applier
-import amp_C
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -19,7 +17,7 @@ from megatron.model.module import param_is_not_shared
 from megatron.utils import unwrap_model
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
-
+from deepspeed.accelerator import get_accelerator
 
 def _zero_grad_group_helper(group, set_to_none):
     """Zero out the gradient for a group of parameters.
@@ -41,7 +39,10 @@ def _multi_tensor_copy_this_to_that(this, that, overflow_buf=None):
     We don't have a blfoat16 implementation so for now if the overflow_buf
     is not provided, we default back to simple loop copy to be compatible
     with bfloat16."""
-    if overflow_buf:
+    if get_accelerator().device_name() == 'cuda' and overflow_buf:
+        from apex.multi_tensor_apply import multi_tensor_applier
+        import amp_C
+
         overflow_buf.fill_(0)
         # Scaling with factor `1.0` is equivalent to copy.
         multi_tensor_applier(amp_C.multi_tensor_scale,
@@ -219,12 +220,12 @@ class MegatronOptimizer(ABC):
             unwrapped_model = unwrap_model(
                 unwrapped_model, (torchDDP, LocalDDP, Float16Module))
 
-            if unwrapped_model.share_word_embeddings:
-                word_embeddings_weight = unwrapped_model.word_embeddings_weight()
+            if unwrapped_model.share_embeddings_and_output_weights:
+                weight = unwrapped_model.shared_embedding_or_output_weight()
                 if args.DDP_impl == 'local':
-                    grad = word_embeddings_weight.main_grad
+                    grad = weight.main_grad
                 else:
-                    grad = word_embeddings_weight.grad
+                    grad = weight.grad
                 torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
 
 
@@ -355,7 +356,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # Note that we keep this for the cases that grad scaler is none.
         # We still record nan/inf if we have a bfloat16 with a grad scaler.
         if self.grad_scaler:
-            self.found_inf = torch.cuda.FloatTensor([0.0])
+            self.found_inf = get_accelerator().FloatTensor([0.0])
 
         # Dummy tensor needed for apex multi-apply tensor.
         # For bfloat, we don't have multi-tensor apply and for now
@@ -363,11 +364,11 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if bf16:
             self._dummy_overflow_buf = None
         else:
-            self._dummy_overflow_buf = torch.cuda.IntTensor([0])
+            self._dummy_overflow_buf = get_accelerator().IntTensor([0])
 
         # In case grad scaler is not passed, define the unity scale.
         if self.grad_scaler is None:
-            self._scale_one = torch.cuda.FloatTensor([1.0])
+            self._scale_one = get_accelerator().FloatTensor([1.0])
 
 
     def get_loss_scale(self):
@@ -522,8 +523,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 if param.requires_grad:
 
                     # float16 params:
-                    if param.type() in ['torch.cuda.HalfTensor',
-                                        'torch.cuda.BFloat16Tensor']:
+
+
+                    if param.type() in ['torch.{}.HalfTensor'.format(get_accelerator().device_name()),
+                                        'torch.{}.BFloat16Tensor'.format(get_accelerator().device_name())]:
                         float16_params_this_group.append(param)
                         # Create a copy
                         main_param = param.detach().clone().float()
@@ -541,16 +544,17 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             self.optimizer.state[main_param] \
                                 = self.optimizer.state.pop(param)
                     # fp32 params.
-                    elif param.type() == 'torch.cuda.FloatTensor':
+                    elif param.type() == 'torch.{}.FloatTensor'.format(format(get_accelerator().device_name())):
                         fp32_params_this_group.append(param)
                         param_group['params'][i] = param
 
                     else:
+                        device_name = get_accelerator().device_name()
                         raise TypeError('Wrapped parameters must be one of '
-                                        'torch.cuda.FloatTensor,  '
-                                        'torch.cuda.HalfTensor, or '
-                                        'torch.cuda.BFloat16Tensor. '
-                                        'Received {}'.format(param.type()))
+                                        'torch.{}.FloatTensor,  '
+                                        'torch.{}.HalfTensor, or '
+                                        'torch.{}.BFloat16Tensor. '
+                                        'Received {}'.format(device_name,device_name,device_name,param.type()))
 
             self.float16_groups.append(float16_params_this_group)
             self.fp32_from_float16_groups.append(
@@ -703,7 +707,7 @@ class FP32Optimizer(MegatronOptimizer):
             params_have_main_grad, use_contiguous_buffers_in_local_ddp,
             models)
 
-        self._scale = torch.cuda.FloatTensor([1.0])
+        self._scale = get_accelerator().FloatTensor([1.0])
 
 
     def zero_grad(self, set_to_none=True):
